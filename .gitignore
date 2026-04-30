@@ -1,0 +1,8 @@
+# Local artifacts not meant for the repo
+*.bak
+*.bak-*
+*.log
+TE2-*-portable/
+TabularEditor.Portable*.zip
+.vscode/
+.idea/
