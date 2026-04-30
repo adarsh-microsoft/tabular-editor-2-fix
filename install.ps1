@@ -95,40 +95,59 @@ Write-Ok "Extracted and unblocked"
 # -- Costura DLL extraction (THE KEY FIX) ------------------------------------
 Write-Step "Extracting Costura embedded DLLs to disk (Defender/AMSI workaround)"
 
-Add-Type -AssemblyName System.IO.Compression
-Add-Type -AssemblyName System.IO.Compression.FileSystem
+# We must use Windows PowerShell 5.1 (.NET Framework) for ReflectionOnlyLoadFrom -
+# PowerShell 7 (.NET 5+) removed that API. Windows PowerShell is always present
+# on Windows at this fixed path.
+$winPS = Join-Path $env:WINDIR 'System32\WindowsPowerShell\v1.0\powershell.exe'
+if (-not (Test-Path $winPS)) {
+    throw "Windows PowerShell 5.1 not found at $winPS - required for Costura extraction."
+}
 
-# Load EXE for reflection-only inspection (no code execution).
-$asm = [System.Reflection.Assembly]::ReflectionOnlyLoadFrom($exe)
+$extractScript = @'
+param([string]$Exe, [string]$OutDir)
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.IO.Compression | Out-Null
+$asm = [System.Reflection.Assembly]::ReflectionOnlyLoadFrom($Exe)
 $resources = $asm.GetManifestResourceNames() | Where-Object { $_ -like 'costura.*.compressed' }
+if (-not $resources) { Write-Output 'NONE'; exit 0 }
+$count = 0
+foreach ($res in $resources) {
+    $outName = $res -replace '^costura\.', '' -replace '\.compressed$', ''
+    $outPath = Join-Path $OutDir $outName
+    $stream  = $asm.GetManifestResourceStream($res)
+    if (-not $stream) { continue }
+    $deflate = New-Object System.IO.Compression.DeflateStream($stream, [System.IO.Compression.CompressionMode]::Decompress)
+    $out = [System.IO.File]::Create($outPath)
+    try { $deflate.CopyTo($out) } finally { $out.Dispose(); $deflate.Dispose(); $stream.Dispose() }
+    $sz = (Get-Item $outPath).Length
+    Write-Output ("FILE|{0}|{1}" -f $outName, $sz)
+    $count++
+}
+Write-Output ("DONE|{0}" -f $count)
+'@
 
-if (-not $resources) {
-    Write-Warn2 "No Costura resources found - this build may not need extraction. Skipping."
-} else {
-    $count = 0
-    foreach ($res in $resources) {
-        # costura.<name>.dll.compressed -> <name>.dll
-        $outName = $res -replace '^costura\.', '' -replace '\.compressed$', ''
-        $outPath = Join-Path $InstallDir $outName
-
-        $stream = $asm.GetManifestResourceStream($res)
-        if (-not $stream) { continue }
-
-        # Costura uses raw Deflate (not gzip).
-        $deflate = New-Object System.IO.Compression.DeflateStream($stream, [System.IO.Compression.CompressionMode]::Decompress)
-        $out = [System.IO.File]::Create($outPath)
-        try {
-            $deflate.CopyTo($out)
-        } finally {
-            $out.Dispose()
-            $deflate.Dispose()
-            $stream.Dispose()
-        }
-        $sz = (Get-Item $outPath).Length
-        Write-Host ("    + {0,-50} {1,12:N0} bytes" -f $outName, $sz)
-        $count++
+$tmpScript = Join-Path $env:TEMP "te2-extract-$([Guid]::NewGuid().ToString('N')).ps1"
+Set-Content -LiteralPath $tmpScript -Value $extractScript -Encoding UTF8
+try {
+    $output = & $winPS -NoProfile -ExecutionPolicy Bypass -File $tmpScript -Exe $exe -OutDir $InstallDir 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw "Costura extraction failed (exit $LASTEXITCODE):`n$($output -join "`n")"
     }
-    Write-Ok "Extracted $count embedded DLL(s)"
+    $count = 0
+    foreach ($line in $output) {
+        $s = "$line"
+        if ($s -eq 'NONE') {
+            Write-Warn2 "No Costura resources found - this build may not need extraction. Skipping."
+        } elseif ($s -like 'FILE|*') {
+            $parts = $s.Split('|')
+            Write-Host ("    + {0,-50} {1,12:N0} bytes" -f $parts[1], [int64]$parts[2])
+        } elseif ($s -like 'DONE|*') {
+            $count = [int]$s.Split('|')[1]
+        }
+    }
+    if ($count -gt 0) { Write-Ok "Extracted $count embedded DLL(s)" }
+} finally {
+    Remove-Item $tmpScript -Force -EA 0
 }
 
 # -- Clear stale per-user cache ---------------------------------------------
